@@ -182,6 +182,7 @@ static void launch(long argc, char** argv, char** envp) {
         if (i + 1 >= argc) die("missing value for ", a);
         if (same(a, "-r")) root = argv[++i];
         else if (same(a, "-b")) add_bind(argv[++i]);
+        else if (same(a, "-B")) { add_bind(argv[++i]); cfg.binds[cfg.bind_count - 1].walked = 1; } /* local: symlinks in it are guest paths */
         else if (same(a, "-w")) workdir = argv[++i];
         else if (same(a, "-d")) {
             const char* p = argv[++i];

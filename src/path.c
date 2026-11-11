@@ -436,6 +436,7 @@ static int other_root(unsigned long pid, char* out) {
         pid = parent;
     }
     return 0;
+}
 
 /* /proc/<pid>/fd/<n>/<rest> (self and thread-self too), a path through a
  * directory fd: the kernel would follow the magic link to the fd's host
