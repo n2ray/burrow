@@ -965,6 +965,43 @@ long emulate_execve(long dirfd, const char* path, char* const* argv, char* const
  * arguments. Root opens files whatever their mode: when the fake root is
  * refused a file of the app's, it gets the permission it lacks for the time
  * of the open, as proot lends u+rw. */
+/* Root writes into read-only directories (dpkg unpacking into one, a 0555
+ * directory a rootfs came with): the kernel refuses the app, so for the guest's
+ * root the directory of @host, if ours, gets u+wx for the call. Its path into
+ * @dir, its mode into @mode; 0 when there was nothing to open up. */
+static int unlock_dir(const char* host, char* dir, uint32_t* mode) {
+    if (id(FSUID) != 0) return 0;
+    long n = copy(dir, PATH_MAX, host);
+    if (n < 0) return 0;
+    while (n > 1 && dir[n - 1] == '/') n--; /* mkdir("a/b/") */
+    while (n > 0 && dir[n - 1] != '/') n--;
+    while (n > 1 && dir[n - 1] == '/') n--;
+    if (n <= 1) return 0;
+    dir[n] = 0;
+    struct kstat st;
+    if (sys(NR_newfstatat, AT_FDCWD, dir, &st, 0) < 0 || st.uid != cfg.real_uid || (st.mode & 0300) == 0300) return 0;
+    if (sys(NR_fchmodat, AT_FDCWD, dir, (st.mode & 07777) | 0300, 0) < 0) return 0;
+    *mode = st.mode & 07777;
+    return 1;
+}
+
+static void relock_dir(const char* dir, uint32_t mode) {
+    sys(NR_fchmodat, AT_FDCWD, dir, mode, 0);
+}
+
+/* @call, again with @host's directory opened up when it was EACCES. */
+#define IN_LOCKED_DIR(host, call)                          \
+    ({                                                     \
+        long r_ = (call);                                  \
+        char d_[PATH_MAX];                                 \
+        uint32_t m_;                                       \
+        if (r_ == -EACCES && unlock_dir((host), d_, &m_)) { \
+            r_ = (call);                                   \
+            relock_dir(d_, m_);                            \
+        }                                                  \
+        r_;                                                \
+    })
+
 static long open_as_root(long nr, const char* host, long flags, long a, long b) {
     if (!(flags & O_PATH) && proc_maps(host)) return proc_maps_open(host, flags);
     if (!(flags & O_PATH) && proc_status(host)) return proc_status_open(host, flags);
@@ -978,6 +1015,15 @@ static long open_as_root(long nr, const char* host, long flags, long a, long b) 
     if (proc >= 0) return proc_open(proc, flags);
     if (r != -EACCES || id(FSUID) != 0 || (flags & O_PATH)) return r;
     struct kstat st;
+    if ((flags & O_CREAT) && sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW) == -ENOENT) {
+        /* A new file in a read-only directory. */
+        char dir[PATH_MAX];
+        uint32_t mode;
+        if (!unlock_dir(host, dir, &mode)) return r;
+        r = sys(nr, AT_FDCWD, host, a, b);
+        relock_dir(dir, mode);
+        return r;
+    }
     if (sys(NR_newfstatat, AT_FDCWD, host, &st, 0) < 0 || st.uid != cfg.real_uid) return r;
     uint32_t need = (flags & 3) == 0 ? 0400 : (flags & 3) == 1 ? 0200 : 0600;
     if ((st.mode & need) == need) return r;
@@ -1323,34 +1369,20 @@ static long emulate(long nr, const uint64_t* x) {
     case NR_umount2: return do_umount((const char*) x[0]);
     case NR_unshare: return do_unshare((long) x[0]);
     case NR_mprotect: return do_mprotect(x);
-    case NR_mkdirat: ON_HOST(0, sys(NR_mkdirat, AT_FDCWD, host, x[2], 0));
-    case NR_mknodat: ON_HOST(0, sys(NR_mknodat, AT_FDCWD, host, x[2], x[3]));
+    case NR_mkdirat: ON_HOST(0, IN_LOCKED_DIR(host, sys(NR_mkdirat, AT_FDCWD, host, x[2], 0)));
+    case NR_mknodat: ON_HOST(0, IN_LOCKED_DIR(host, sys(NR_mknodat, AT_FDCWD, host, x[2], x[3])));
     case NR_unlinkat: {
         char host[PATH_MAX];
         long r = host_path(dirfd, path, 0, host);
         if (r < 0) return r;
         if (!(x[2] & 0x200 /* AT_REMOVEDIR */) && (r = l2s_unlinked(host)) < 0) return r;
-        r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
-        if (r != -EACCES || id(FSUID) != 0) return r;
         /* Root removes from read-only directories too (rm -rf of Go's module cache). */
-        long slash = length_of(host);
-        while (slash > 0 && host[slash] != '/') slash--;
-        if (slash == 0) return r;
-        host[slash] = 0;
-        struct kstat st;
-        if (sys(NR_newfstatat, AT_FDCWD, host, &st, 0) < 0 || st.uid != cfg.real_uid || (st.mode & 0300) == 0300 ||
-            sys(NR_fchmodat, AT_FDCWD, host, (st.mode & 07777) | 0300, 0) < 0)
-            return r;
-        host[slash] = '/';
-        r = sys(NR_unlinkat, AT_FDCWD, host, x[2], 0);
-        host[slash] = 0;
-        sys(NR_fchmodat, AT_FDCWD, host, st.mode & 07777, 0);
-        return r;
+        return IN_LOCKED_DIR(host, sys(NR_unlinkat, AT_FDCWD, host, x[2], 0));
     }
     case NR_symlinkat: {
         dirfd = (long) (int) x[1];
         path = (const char*) x[2];
-        ON_HOST(0, sys(NR_symlinkat, x[0], AT_FDCWD, host, 0));
+        ON_HOST(0, IN_LOCKED_DIR(host, sys(NR_symlinkat, x[0], AT_FDCWD, host, 0)));
     }
     case NR_linkat: {
         char from[PATH_MAX], to[PATH_MAX];
@@ -1372,7 +1404,19 @@ static long emulate(long nr, const uint64_t* x) {
         r = host_path((long) (int) x[2], (const char*) x[3], 0, to);
         if (r < 0) return r;
         r = sys6(NR_linkat, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags & AT_SYMLINK_FOLLOW, 0);
-        return r == -EACCES || r == -EPERM ? l2s_link(from, to) : r;
+        if (r != -EACCES && r != -EPERM) return r;
+        r = l2s_link(from, to);
+        if (r != -EACCES) return r;
+        /* Root links in read-only directories (dpkg's backup link of a file it replaces): the
+         * faked link renames the file and adds symlinks beside it and at @to. */
+        char from_dir[PATH_MAX], to_dir[PATH_MAX];
+        uint32_t from_mode, to_mode;
+        int from_unlocked = unlock_dir(from, from_dir, &from_mode);
+        int to_unlocked = unlock_dir(to, to_dir, &to_mode);
+        if (from_unlocked || to_unlocked) r = l2s_link(from, to);
+        if (to_unlocked) relock_dir(to_dir, to_mode);
+        if (from_unlocked) relock_dir(from_dir, from_mode);
+        return r;
     }
     case NR_renameat:
     case NR_renameat2: {
@@ -1384,7 +1428,18 @@ static long emulate(long nr, const uint64_t* x) {
         if (r < 0) return r;
         /* A faked hard link replaced: one link less. */
         if ((r = l2s_unlinked(to)) < 0) return r;
-        return sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, nr == NR_renameat ? 0 : (long) x[4], 0);
+        long flags = nr == NR_renameat ? 0 : (long) x[4];
+        r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
+        if (r != -EACCES) return r;
+        /* Root renames out of and into read-only directories (dpkg's .dpkg-new into place). */
+        char from_dir[PATH_MAX], to_dir[PATH_MAX];
+        uint32_t from_mode, to_mode;
+        int from_unlocked = unlock_dir(from, from_dir, &from_mode);
+        int to_unlocked = unlock_dir(to, to_dir, &to_mode);
+        if (from_unlocked || to_unlocked) r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
+        if (to_unlocked) relock_dir(to_dir, to_mode);
+        if (from_unlocked) relock_dir(from_dir, from_mode);
+        return r;
     }
     case NR_fchmodat: ON_HOST(1, sys(NR_fchmodat, AT_FDCWD, host, x[2], 0));
     case NR_fchmodat2:
