@@ -22,7 +22,7 @@ static const uint16_t trapped[] = {
     NR_lremovexattr, NR_getcwd, NR_inotify_add_watch, NR_mknodat, NR_mkdirat, NR_unlinkat, NR_symlinkat,
     NR_linkat, NR_renameat, NR_statfs, NR_fstatfs, NR_truncate, NR_faccessat, NR_chdir, NR_fchmodat, NR_fchownat, NR_fchown,
     NR_openat, NR_readlinkat, NR_getdents64, NR_newfstatat, NR_fstat, NR_utimensat, NR_rt_sigaction, NR_rt_sigprocmask,
-    NR_rt_sigreturn,
+    NR_rt_sigreturn, NR_rt_sigsuspend,
     NR_setregid, NR_setgid, NR_setreuid, NR_setuid, NR_setresuid, NR_getresuid, NR_setresgid, NR_getresgid,
     NR_setfsuid, NR_setfsgid, NR_getgroups, NR_setgroups, NR_getuid, NR_geteuid, NR_getgid, NR_getegid, NR_bind, NR_connect,
     NR_execve, NR_renameat2, NR_execveat, NR_statx, NR_openat2, NR_faccessat2, NR_fchmodat2, NR_sendmsg,
@@ -62,7 +62,7 @@ struct sock_filter {
 
 long install_filter(void) {
     uint64_t gadget = (uint64_t) burrow_gadget;
-    struct sock_filter f[10 + N_TRAPPED + 40];
+    struct sock_filter f[10 + N_TRAPPED + 70];
     int i = 0;
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 4}; /* arch */
     f[i++] = (struct sock_filter){JEQ, 1, 0, AUDIT_ARCH_AARCH64};
@@ -120,6 +120,20 @@ long install_filter(void) {
     f[i++] = (struct sock_filter){JEQ, 0, 1, TCSETSF2};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_TRAP | TRAP_DATA};
     f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+    /* The waits that swap in a signal mask, only with one (see wait_masked()). */
+    static const struct {
+        uint16_t nr, arg;
+    } masked[] = {{NR_ppoll, 3}, {NR_pselect6, 5}, {NR_epoll_pwait, 4}, {NR_epoll_pwait2, 4}};
+    for (unsigned m = 0; m < sizeof(masked) / sizeof(*masked); m++) {
+        uint32_t low = 16 + 8 * (uint32_t) masked[m].arg;
+        f[i++] = (struct sock_filter){JEQ, 0, 6, masked[m].nr};
+        f[i++] = (struct sock_filter){LD_ABS, 0, 0, low};
+        f[i++] = (struct sock_filter){JEQ, 0, 2, 0};
+        f[i++] = (struct sock_filter){LD_ABS, 0, 0, low + 4};
+        f[i++] = (struct sock_filter){JEQ, 1, 0, 0};
+        f[i++] = (struct sock_filter){RET, 0, 0, RET_TRAP | TRAP_DATA};
+        f[i++] = (struct sock_filter){RET, 0, 0, RET_ALLOW};
+    }
     /* mprotect() of an executable stack only, see do_mprotect(). */
     f[i++] = (struct sock_filter){JEQ, 0, 3, NR_mprotect};
     f[i++] = (struct sock_filter){LD_ABS, 0, 0, 32}; /* args[2], low half */
@@ -230,6 +244,37 @@ static long do_sigprocmask(uint64_t* mask, long how, const uint64_t* set, uint64
     if (old != 0) *old = *mask;
     *mask = now;
     return 0;
+}
+
+/* sigsuspend() and the waits that take a mask (ppoll, pselect6, epoll_pwait,
+ * epoll_pwait2) block it for their length, and the signals they let in run
+ * with it: a JavaScriptCore thread suspended by SIGPWR waits in sigsuspend()
+ * with all but the resume signal blocked, and the resume handler's trapped
+ * rt_sigreturn killed it. Their masks are filtered too; the call blocks here,
+ * guest signals open (on_our_stack()). */
+static long wait_masked(long nr, const uint64_t* x) {
+    uint64_t mask;
+    if (nr == NR_rt_sigsuspend) {
+        if (x[1] != 8) return -EINVAL;
+        mask = *(const uint64_t*) x[0] & ~SIGSYS_BIT;
+        return sys(NR_rt_sigsuspend, &mask, 8, 0, 0);
+    }
+    if (nr == NR_pselect6) {
+        const uint64_t* data = (const uint64_t*) x[5]; /* {sigmask, size} */
+        uint64_t mine[2] = {data[0], data[1]};
+        if (mine[0] != 0 && mine[1] == 8) {
+            mask = *(const uint64_t*) mine[0] & ~SIGSYS_BIT;
+            mine[0] = (uint64_t) &mask;
+        }
+        return sys6(nr, (long) x[0], (long) x[1], (long) x[2], (long) x[3], (long) x[4], (long) mine);
+    }
+    int arg = nr == NR_ppoll ? 3 : 4; /* the mask, then its size */
+    uint64_t a[6] = {x[0], x[1], x[2], x[3], x[4], x[5]};
+    if (a[arg] != 0 && a[arg + 1] == 8) {
+        mask = *(const uint64_t*) a[arg] & ~SIGSYS_BIT;
+        a[arg] = (uint64_t) &mask;
+    }
+    return sys6(nr, (long) a[0], (long) a[1], (long) a[2], (long) a[3], (long) a[4], (long) a[5]);
 }
 
 /* A SIGSYS that is not ours: the guest's own filters (Firefox's sandbox),
@@ -1433,6 +1478,11 @@ static void on_trap(struct ksiginfo* info, struct kucontext* uc) {
          * from the gadget once this handler returns. */
         ((struct kucontext*) (uc->mcontext.sp + 128))->sigmask &= ~SIGSYS_BIT;
         uc->mcontext.pc = (uintptr_t) burrow_gadget;
+        return;
+    }
+    if (info->syscall == NR_rt_sigsuspend || info->syscall == NR_ppoll || info->syscall == NR_pselect6 ||
+        info->syscall == NR_epoll_pwait || info->syscall == NR_epoll_pwait2) {
+        x[0] = (uint64_t) wait_masked(info->syscall, x);
         return;
     }
     x[0] = (uint64_t) emulate(info->syscall, x);
