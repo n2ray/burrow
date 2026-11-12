@@ -30,7 +30,8 @@ def error_of(f):
 d = os.path.realpath(tempfile.mkdtemp(prefix="burrow-exec."))
 ok(run("/bin/echo", "hi") == "hi\n", "a program")
 ok(run("echo", "hi") == "hi\n", "a program from PATH")
-ok(run("readlink", "/proc/self/exe") == "/usr/bin/readlink\n", "its /proc/self/exe")
+# The resolved path: a multi-call binary's link (uutils' coreutils, /usr/bin/readlink -> ../lib/cargo/bin/coreutils/readlink) reads as its target.
+ok(run("readlink", "/proc/self/exe") == os.path.realpath(shutil.which("readlink")) + "\n", "its /proc/self/exe")
 ok(run("cat", "/proc/self/comm") == "cat\n", "its name")
 ok("BURROW" not in run("env"), "Burrow's state is not in the environment")
 
