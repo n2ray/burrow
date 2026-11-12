@@ -13,7 +13,10 @@
  * after the inode, so a link never adds or renames entries in the directory
  * linked from: copies with hard links (cp -al, rsync -H, pressure-vessel)
  * walk it as they link. Where the rootfs is another filesystem, the chain
- * stays beside the file, as proot made it.
+ * stays beside the file, as proot made it. So does a file outside the rootfs
+ * (in a binding): the store would make it depend on the rootfs, and a backup,
+ * a move or a new rootfs would leave its links dangling (git's objects in a
+ * bound home: every one is linked into place).
  */
 
 #include "burrow.h"
@@ -130,6 +133,45 @@ int l2s_statx(const char* host, long flags, long mask, struct kstatx* stx) {
     return 1;
 }
 
+/* @host about to go, one link left of a chain kept beside it: the file takes
+ * the place of that other link, and the chain is gone. A file is only ever
+ * linked into place this way (git's objects: written, linked, the first name
+ * removed), so it would otherwise stay a chain for good, with its .l2s.
+ * entries in the directory. The link left is looked for beside the chain,
+ * where the first name was (a clone's gc drops the clone's names, the
+ * original's stay); not in the store's, whose links may be anywhere. */
+static void collapse(const char* host, const char* intermediate, const char* final) {
+    long dir_length = base_name(intermediate) - intermediate;
+    long store_length = cfg.root_length + (long) sizeof("/" STORE "/") - 1;
+    if (dir_length <= 1 || (dir_length == store_length && memcmp(intermediate, cfg.root, cfg.root_length) == 0 &&
+                            memcmp(intermediate + cfg.root_length, "/" STORE "/", sizeof("/" STORE "/") - 1) == 0))
+        return;
+    char dir[PATH_MAX], other[PATH_MAX], target[PATH_MAX], buf[4096];
+    memcpy(dir, intermediate, dir_length - 1);
+    dir[dir_length - 1] = 0;
+    long fd = sys(NR_openat, AT_FDCWD, dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (fd < 0) return;
+    int found = 0;
+    for (long size; found < 2 && (size = sys(NR_getdents64, fd, buf, sizeof(buf), 0)) > 0;) {
+        for (long at = 0; at < size; at += *(uint16_t*) (buf + at + 16)) {
+            const char* name = buf + at + 19;
+            char type = buf[at + 18];
+            if (type != 10 /* DT_LNK */ && type != 0 /* DT_UNKNOWN */) continue;
+            long n = sys(NR_readlinkat, fd, name, target, PATH_MAX - 1);
+            if (n <= 0) continue;
+            target[n] = 0;
+            if (!same(target, intermediate) || dir_length + length_of(name) >= PATH_MAX) continue;
+            memcpy(target, intermediate, dir_length);
+            memcpy(target + dir_length, name, length_of(name) + 1);
+            if (same(target, host)) continue; /* the name going */
+            if (++found == 1) memcpy(other, target, length_of(target) + 1);
+        }
+    }
+    sys(NR_close, fd, 0, 0, 0);
+    if (found != 1) return;
+    if (sys(NR_renameat, AT_FDCWD, final, AT_FDCWD, other) == 0) sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
+}
+
 long l2s_unlinked(const char* host) {
     char intermediate[PATH_MAX], final[PATH_MAX], next[PATH_MAX];
     struct kstat st;
@@ -141,7 +183,9 @@ long l2s_unlinked(const char* host) {
         with_count(final, count, next);
         if ((r = sys(NR_renameat, AT_FDCWD, final, AT_FDCWD, next)) < 0) return r;
         sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
-        return sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0);
+        if ((r = sys(NR_symlinkat, next, AT_FDCWD, intermediate, 0)) < 0) return r;
+        if (count == 1) collapse(host, intermediate, next);
+        return 0;
     }
     sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
     return sys(NR_unlinkat, AT_FDCWD, final, 0, 0);
@@ -184,7 +228,9 @@ long l2s_link(const char* old, const char* new) {
         char store[PATH_MAX], ino[24];
         long n = cfg.root_length + (long) sizeof("/" STORE "/") - 1;
         format_unsigned(ino, st.ino);
-        if (n < PATH_MAX) {
+        int inside = memcmp(old, cfg.root, cfg.root_length) == 0 && old[cfg.root_length] == '/';
+        if (!inside) r = -EXDEV; /* beside it, below */
+        else if (n < PATH_MAX) {
             memcpy(store, cfg.root, cfg.root_length);
             memcpy(store + cfg.root_length, "/" STORE "/", n - cfg.root_length + 1);
             r = new_chain(old, store, n, ino, intermediate, final);
