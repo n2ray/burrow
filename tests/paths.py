@@ -198,6 +198,54 @@ for t in threads:
     t.join()
 ok(not errors, "8 threads x 1500 path calls")
 
+# openat2(RESOLVE_BENEATH), checked on the guest's tree (GNU tar 1.35 opens every directory it extracts into so)
+import ctypes
+import subprocess
+
+libc = ctypes.CDLL(None, use_errno=True)
+
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [("flags", ctypes.c_uint64), ("mode", ctypes.c_uint64), ("resolve", ctypes.c_uint64)]
+
+
+def openat2(dirfd, p, flags, resolve, mode=0):
+    how = OpenHow(flags, mode, resolve)
+    r = libc.syscall(437, dirfd, p.encode(), ctypes.byref(how), ctypes.sizeof(how))
+    if r < 0:
+        return -ctypes.get_errno()
+    os.close(r)
+    return 0
+
+
+BENEATH, NO_SYMLINKS = 0x08, 0x04
+e = tempfile.mkdtemp()
+os.makedirs(e + "/sub/deep")
+os.symlink("sub", e + "/rel")
+os.symlink("/etc", e + "/abs")
+os.symlink("../..", e + "/sub/esc")
+os.symlink("../../sub", e + "/sub/deep/back")
+fd = os.open(e, os.O_PATH | os.O_DIRECTORY)
+DIR = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
+ok(openat2(fd, "sub/", DIR, BENEATH) == 0, "openat2 BENEATH: a directory below")
+ok(openat2(fd, "sub/deep/../deep/", DIR, BENEATH) == 0, "openat2 BENEATH: .. that stays below")
+ok(openat2(fd, "../", DIR, BENEATH) == -errno.EXDEV, "openat2 BENEATH: .. above it, EXDEV")
+ok(openat2(fd, "/etc", os.O_PATH, BENEATH) == -errno.EXDEV, "openat2 BENEATH: an absolute path, EXDEV")
+ok(openat2(fd, "abs/", DIR, BENEATH) == -errno.EXDEV, "openat2 BENEATH: an absolute symlink, EXDEV")
+ok(openat2(fd, "rel/deep/", DIR, BENEATH) == 0, "openat2 BENEATH: a relative symlink below")
+ok(openat2(fd, "sub/deep/back/deep/", DIR, BENEATH) == 0, "openat2 BENEATH: a symlink with .., still below")
+ok(openat2(fd, "sub/esc/", DIR, BENEATH) == -errno.EXDEV, "openat2 BENEATH: a symlink out of it, EXDEV")
+ok(openat2(fd, "rel/", DIR, BENEATH | NO_SYMLINKS) == -errno.ELOOP, "openat2 BENEATH | NO_SYMLINKS: ELOOP")
+ok(openat2(fd, "abs", os.O_PATH | os.O_NOFOLLOW, BENEATH) == 0, "openat2 BENEATH: the symlink itself, not followed")
+ok(openat2(fd, "sub/new", os.O_WRONLY | os.O_CREAT | os.O_EXCL, BENEATH, 0o644) == 0 and os.path.isfile(e + "/sub/new"), "openat2 BENEATH: O_CREAT")
+os.close(fd)
+if shutil.which("tar"):
+    subprocess.run(["tar", "cf", e + "/x.tar", "-C", e, "sub"], check=True)
+    os.makedirs(e + "/out")
+    r = subprocess.run(["tar", "xf", e + "/x.tar", "-C", e + "/out"], capture_output=True, text=True)
+    ok(r.returncode == 0 and os.path.isfile(e + "/out/sub/new") and os.path.islink(e + "/out/sub/esc"), "tar extracts (openat2 BENEATH)")
+shutil.rmtree(e)
+
 shutil.rmtree(d)
 ok(not os.path.exists(d), "rmtree")
 sys.exit(1 if fails else 0)

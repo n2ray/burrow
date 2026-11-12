@@ -1191,6 +1191,73 @@ static long do_chroot(const char* path) {
 
 /* -- Dispatch ------------------------------------------------------------------------------- */
 
+#define RESOLVE_NO_XDEV 0x01
+#define RESOLVE_NO_MAGICLINKS 0x02
+#define RESOLVE_BENEATH 0x08
+
+/* Whether @path from @dirfd stays beneath it, as openat2()'s RESOLVE_BENEATH
+ * (and RESOLVE_NO_SYMLINKS) would have the kernel check it on the guest's
+ * tree: relative, no ".." above @dirfd, no absolute symlink, a relative one
+ * followed in place. 0 when it does (or a component is missing: the open
+ * says), -EXDEV or -ELOOP when not. GNU tar 1.35 opens every directory it
+ * extracts into this way, and takes ENOSYS for a failure. */
+static long beneath(long dirfd, const char* path, int follow, int no_symlinks) {
+    char rest[PATH_MAX], done[PATH_MAX], target[PATH_MAX], host[PATH_MAX], final[PATH_MAX];
+    if (path[0] == '/') return -EXDEV;
+    long rest_length = copy(rest, PATH_MAX, path);
+    if (rest_length < 0) return rest_length;
+    long n = 0, at = 0, links = 0, depth = 0;
+    done[0] = 0;
+    for (;;) {
+        while (rest[at] == '/') at++;
+        if (rest[at] == 0) return 0;
+        long start = at;
+        while (rest[at] != 0 && rest[at] != '/') at++;
+        long length = at - start;
+        const char* c = rest + start;
+        if (length == 1 && c[0] == '.') continue;
+        if (length == 2 && c[0] == '.' && c[1] == '.') {
+            if (depth == 0) return -EXDEV;
+            while (n > 0 && done[n - 1] != '/') n--;
+            if (n > 0) n--;
+            done[n] = 0;
+            depth--;
+            continue;
+        }
+        long previous = n;
+        if (n + 1 + length >= PATH_MAX) return -ENAMETOOLONG;
+        if (n > 0) done[n++] = '/';
+        memcpy(done + n, c, length);
+        n += length;
+        done[n] = 0;
+        depth++;
+        long after = at;
+        while (rest[after] == '/') after++;
+        int last = rest[after] == 0;
+        if (last && !follow && rest[at] != '/') return 0; /* not followed: no trailing slash */
+        if (host_path(dirfd, done, 0, host) < 0) return 0;
+        struct kstat st;
+        if (sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW) < 0) return 0;
+        if ((st.mode & S_IFMT) != S_IFLNK || l2s_file(host, final)) continue; /* a faked hard link is a file */
+        if (no_symlinks) return -ELOOP;
+        if (++links > 40) return -ELOOP;
+        long t = sys(NR_readlinkat, AT_FDCWD, host, target, PATH_MAX - 1);
+        if (t < 0) return t;
+        target[t] = 0;
+        if (target[0] == '/') return -EXDEV;
+        /* The link's directory, then its target, then what was left. */
+        n = previous;
+        done[n] = 0;
+        depth--;
+        long tail = rest_length - at;
+        if (t + tail >= PATH_MAX) return -ENAMETOOLONG;
+        memmove(rest + t, rest + at, tail + 1);
+        memcpy(rest, target, t);
+        rest_length = t + tail;
+        at = 0;
+    }
+}
+
 static long emulate(long nr, const uint64_t* x) {
     long dirfd = (long) (int) x[0];
     const char* path = (const char*) x[1];
@@ -1208,10 +1275,21 @@ static long emulate(long nr, const uint64_t* x) {
     }
     case NR_openat2: {
         const struct open_how* how = (const struct open_how*) x[2];
-        /* RESOLVE_BENEATH and the like would apply to the host path (EXDEV for
-         * an absolute one): say openat2 is missing, and callers (libglnx's,
-         * Flatpak's) confine the path themselves. */
-        if (how != 0 && how->resolve != 0) return -ENOSYS;
+        /* RESOLVE_BENEATH would apply to the host path (EXDEV for an absolute
+         * one): checked on the guest's tree here (with RESOLVE_NO_SYMLINKS,
+         * if asked), then opened as openat() would. Any other resolve: say
+         * openat2 is missing, and callers (libglnx's, Flatpak's) confine the
+         * path themselves. NO_XDEV and NO_MAGICLINKS are not checked. */
+        if (how != 0 && how->resolve != 0) {
+            if (!(how->resolve & RESOLVE_BENEATH) ||
+                (how->resolve & ~(uint64_t) (RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS)))
+                return -ENOSYS;
+            int last = !(how->flags & O_NOFOLLOW) && (how->flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL);
+            long r = beneath(dirfd, path, last, (how->resolve & RESOLVE_NO_SYMLINKS) != 0);
+            if (r < 0) return r;
+            uint64_t y[4] = {x[0], x[1], how->flags, how->mode};
+            return emulate(NR_openat, y);
+        }
         int follow = !(how->flags & O_NOFOLLOW) && (how->flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL);
         ON_HOST(follow, l2s_path_fd(open_as_root(NR_openat2, host, (long) how->flags, (long) how, (long) x[3]),
                                     (long) how->flags));
