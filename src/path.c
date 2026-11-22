@@ -199,18 +199,167 @@ static int plain(const char* p) {
  * handler makes it ENOSYS, and every path then takes the walk. */
 static int no_openat2;
 
-/* openat2() of @host, -ELOOP (walk it) where the kernel or Android lacks it. */
+/* Without openat2, RESOLVE_NO_SYMLINKS is done here: the directories of a
+ * path, each found no symlink once, are remembered with their inode; a later
+ * path in one costs a stat of it (that the inode is still the one) and the
+ * open itself, not a stat of every component. A directory renamed or replaced
+ * has another inode, and is checked again. The host prefixes the walk trusts
+ * (the rootfs, a binding's host side) are not checked: the walk never does.
+ *
+ * Direct-mapped, shared by the threads: an entry's seq is odd while it is
+ * written, and a reader that sees it change ignores what it read. */
+#define DIR_CACHE 256
+#define DIR_CACHE_PATH 216
+struct dir_entry {
+    uint32_t seq, length;
+    uint64_t dev, ino;
+    char path[DIR_CACHE_PATH];
+};
+static struct dir_entry dir_cache[DIR_CACHE];
+
+static uint32_t dir_hash(const char* p, long n) {
+    uint32_t h = 2166136261u;
+    for (long i = 0; i < n; i++) h = (h ^ (unsigned char) p[i]) * 16777619u;
+    return h % DIR_CACHE;
+}
+
+/* Whether the directory @p (@n bytes) was found no symlink, as inode @dev/@ino. */
+static int dir_cached(const char* p, long n, uint64_t* dev, uint64_t* ino) {
+    if (n >= DIR_CACHE_PATH) return 0;
+    struct dir_entry* e = &dir_cache[dir_hash(p, n)];
+    uint32_t s = __atomic_load_n(&e->seq, __ATOMIC_ACQUIRE);
+    if (s & 1) return 0;
+    int hit = e->length == (uint32_t) n && memcmp(e->path, p, n) == 0;
+    *dev = e->dev;
+    *ino = e->ino;
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return hit && __atomic_load_n(&e->seq, __ATOMIC_RELAXED) == s;
+}
+
+static void dir_remember(const char* p, long n, uint64_t dev, uint64_t ino) {
+    if (n >= DIR_CACHE_PATH) return;
+    struct dir_entry* e = &dir_cache[dir_hash(p, n)];
+    uint32_t s = __atomic_load_n(&e->seq, __ATOMIC_RELAXED);
+    /* Another thread (or a signal handler under this one) writing it: skip. */
+    if ((s & 1) || !__atomic_compare_exchange_n(&e->seq, &s, s + 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    e->length = (uint32_t) n;
+    memcpy(e->path, p, n);
+    e->dev = dev;
+    e->ino = ino;
+    __atomic_store_n(&e->seq, s + 2, __ATOMIC_RELEASE);
+}
+
+/* Whether the host directory @p (@n bytes) is one the walk takes on trust. */
+static int trusted_dir(const char* p, long n) {
+    if (n <= cfg.root_length && memcmp(cfg.root, p, n) == 0 && (n == cfg.root_length || cfg.root[n] == '/')) return 1;
+    for (int i = 0; i < cfg.bind_count; i++) {
+        const struct bind* b = &cfg.binds[i];
+        if (n <= b->host_length && memcmp(b->host, p, n) == 0 && (n == b->host_length || b->host[n] == '/'))
+            return 1;
+    }
+    return 0;
+}
+
+/* 0 if the absolute host path @p (@n bytes, written to while checked) is a
+ * directory with no symlink on the way; -ELOOP if one is, else the error a
+ * lookup gives (ENOENT, ENOTDIR, EACCES). */
+static long dir_no_symlinks(char* p, long n) {
+    while (n > 1 && p[n - 1] == '/') n--;
+    if (n <= 1 || trusted_dir(p, n)) return 0;
+    char kept = p[n];
+    p[n] = 0;
+    struct kstat st;
+    uint64_t dev, ino;
+    long r = sys(NR_newfstatat, AT_FDCWD, p, &st, AT_SYMLINK_NOFOLLOW);
+    if (r == 0 && (st.mode & S_IFMT) == S_IFDIR && dir_cached(p, n, &dev, &ino) && dev == st.dev && ino == st.ino) {
+        p[n] = kept;
+        return 0;
+    }
+    p[n] = kept;
+    /* Not known (or changed): its directory first, so that the error is the first component's, as the kernel's. */
+    long slash = n - 1;
+    while (slash > 0 && p[slash] != '/') slash--;
+    long up = dir_no_symlinks(p, slash == 0 ? 1 : slash);
+    if (up < 0) return up;
+    if (r < 0) return r;
+    if ((st.mode & S_IFMT) == S_IFLNK) return -ELOOP;
+    if ((st.mode & S_IFMT) != S_IFDIR) return -ENOTDIR;
+    dir_remember(p, n, st.dev, st.ino);
+    return 0;
+}
+
+/* RESOLVE_NO_SYMLINKS for the host path @host where the kernel has no openat2,
+ * its last component apart: its directory checked as above, and a symlink at
+ * the end refused if a trailing slash would follow it. */
+static long up_to_last(const char* host) {
+    char dir[PATH_MAX];
+    long n = copy(dir, PATH_MAX, host);
+    if (n < 0) return n;
+    long end = n, depth = 0;
+    for (long i = 0; i < n; i++) depth += dir[i] == '/';
+    if (depth > 64) return -ELOOP; /* dir_no_symlinks() recurses: the walk takes such paths */
+    while (end > 1 && dir[end - 1] == '/') end--; /* "a/b/" is b, in a */
+    long slash = end - 1;
+    while (slash > 0 && dir[slash] != '/') slash--;
+    long r = dir_no_symlinks(dir, slash == 0 ? 1 : slash);
+    if (r < 0 || end == n) return r;
+    /* A trailing slash follows a symlink at the end whatever O_NOFOLLOW says. */
+    struct kstat st;
+    dir[end] = 0;
+    r = sys(NR_newfstatat, AT_FDCWD, dir, &st, AT_SYMLINK_NOFOLLOW);
+    return r == 0 && (st.mode & S_IFMT) == S_IFLNK ? -ELOOP : 0;
+}
+
+/* openat2(@host, @how) with RESOLVE_NO_SYMLINKS (the only resolve asked here)
+ * where the kernel has no openat2: up_to_last(), then the open itself
+ * refusing a symlink at the end. */
+static long open_no_symlinks(const char* host, struct open_how* how) {
+    long r = up_to_last(host);
+    if (r < 0) return r;
+    long flags = (long) how->flags;
+    long fd = sys(NR_openat, AT_FDCWD, host, flags | O_NOFOLLOW, (long) how->mode);
+    /* O_PATH | O_NOFOLLOW opens a symlink itself: RESOLVE_NO_SYMLINKS refuses it unless O_NOFOLLOW was asked. */
+    if (fd >= 0 && (flags & O_PATH) && !(flags & O_NOFOLLOW)) {
+        struct kstat st;
+        if (sys(NR_newfstatat, fd, "", &st, AT_EMPTY_PATH) < 0 || (st.mode & S_IFMT) == S_IFLNK) {
+            sys(NR_close, fd, 0, 0, 0);
+            return -ELOOP;
+        }
+    }
+    return fd;
+}
+
+/* Whether the host path @host has no symlink, but at the end unless @follow:
+ * 0, -ELOOP, or the error a lookup gives. No fd: the caller's own call on
+ * @host is the one look at the last component (with no openat2 only). */
+static long no_symlinks_path(const char* host, int follow) {
+    long r = up_to_last(host);
+    if (r < 0 || !follow) return r;
+    struct kstat st;
+    r = sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW);
+    if (r < 0) return r;
+    return (st.mode & S_IFMT) == S_IFLNK ? -ELOOP : 0;
+}
+
+/* openat2() of @host, done as above where the kernel or Android lacks it. */
 static long open_how_host(const char* host, struct open_how* how) {
-    if (no_openat2) return -ELOOP;
+    if (no_openat2) return open_no_symlinks(host, how);
     long r = sys(NR_openat2, AT_FDCWD, host, how, sizeof(*how));
     if (r != -ENOSYS) return r;
     no_openat2 = 1;
-    return -ELOOP;
+    return open_no_symlinks(host, how);
 }
 
 /* Whether the host path @host exists without any symlink (the last component
  * is not followed unless @follow). */
 static long no_symlinks(const char* host, int follow, long extra) {
+    if (no_openat2) {
+        /* No fd to open and close: the caller's own call looks at the last component. */
+        if (!(extra & O_DIRECTORY)) return no_symlinks_path(host, follow);
+        char dir[PATH_MAX];
+        long n = copy(dir, PATH_MAX, host);
+        return n < 0 ? n : dir_no_symlinks(dir, n);
+    }
     struct open_how how = {O_PATH | O_CLOEXEC | (follow ? 0 : O_NOFOLLOW) | extra, 0, RESOLVE_NO_SYMLINKS};
     long fd = open_how_host(host, &how);
     if (fd >= 0) sys(NR_close, fd, 0, 0, 0);
@@ -535,6 +684,16 @@ long host_fd(long dirfd, const char* path, int follow, char* host, long* fd) {
     uint64_t start = stats_start();
     r = host_of(guest, length_of(guest), host);
     if (r < 0) return r;
+    if (no_openat2) {
+        r = no_symlinks_path(host, follow);
+        if (r != -ELOOP) {
+            stats_step(STATS_PROBE, start);
+            return r;
+        }
+        r = walk(guest, follow, host, resolved);
+        stats_step(STATS_WALK, start);
+        return r;
+    }
     struct open_how how = {O_PATH | O_CLOEXEC | (follow ? 0 : O_NOFOLLOW), 0, RESOLVE_NO_SYMLINKS};
     r = open_how_host(host, &how);
     if (r != -ELOOP) {
