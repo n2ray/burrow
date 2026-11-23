@@ -1441,10 +1441,20 @@ static long emulate(long nr, const uint64_t* x) {
         if (from_unlocked) relock_dir(from_dir, from_mode);
         return r;
     }
-    case NR_fchmodat: ON_HOST(1, sys(NR_fchmodat, AT_FDCWD, host, x[2], 0));
-    case NR_fchmodat2:
-        if (empty(path) && (x[3] & AT_EMPTY_PATH)) return sys(NR_fchmodat2, x[0], path, x[2], x[3]);
-        ON_HOST(!(x[3] & AT_SYMLINK_NOFOLLOW), sys(NR_fchmodat2, AT_FDCWD, host, x[2], x[3] & ~AT_EMPTY_PATH));
+    case NR_fchmodat:
+    case NR_fchmodat2: {
+        if (nr == NR_fchmodat2 && empty(path) && (x[3] & AT_EMPTY_PATH)) return sys(NR_fchmodat2, x[0], path, x[2], x[3]);
+        char host[PATH_MAX];
+        long r = host_path(dirfd, path, nr == NR_fchmodat || !(x[3] & AT_SYMLINK_NOFOLLOW), host);
+        if (r < 0) return r;
+        r = nr == NR_fchmodat ? sys(NR_fchmodat, AT_FDCWD, host, x[2], 0)
+                              : sys(NR_fchmodat2, AT_FDCWD, host, x[2], x[3] & ~AT_EMPTY_PATH);
+        /* Android refuses an app any mode change on its own pseudo-terminals. Root's chmod there (sshd's
+         * pty_setowner, 0620 for the tty group) succeeds, as chown does everywhere: sshd takes the
+         * failure as fatal and closes every interactive login. */
+        if ((r == -EACCES || r == -EPERM) && id(EUID) == 0 && starts_with(host, "/dev/pts/")) return 0;
+        return r;
+    }
     case NR_fchownat: return do_chown(dirfd, path, (long) x[4]);
     case NR_fchown: {
         struct kstat st;
