@@ -1304,6 +1304,20 @@ static long beneath(long dirfd, const char* path, int follow, int no_symlinks) {
     }
 }
 
+long rename_as_root(const char* from, const char* to, long flags) {
+    long r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
+    if (r != -EACCES) return r;
+    /* Root renames out of and into read-only directories (dpkg's .dpkg-new into place). */
+    char from_dir[PATH_MAX], to_dir[PATH_MAX];
+    uint32_t from_mode, to_mode;
+    int from_unlocked = unlock_dir(from, from_dir, &from_mode);
+    int to_unlocked = unlock_dir(to, to_dir, &to_mode);
+    if (from_unlocked || to_unlocked) r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
+    if (to_unlocked) relock_dir(to_dir, to_mode);
+    if (from_unlocked) relock_dir(from_dir, from_mode);
+    return r;
+}
+
 static long emulate(long nr, const uint64_t* x) {
     long dirfd = (long) (int) x[0];
     const char* path = (const char*) x[1];
@@ -1426,20 +1440,8 @@ static long emulate(long nr, const uint64_t* x) {
         char to[PATH_MAX];
         r = host_path((long) (int) x[2], (const char*) x[3], 0, to);
         if (r < 0) return r;
-        /* A faked hard link replaced: one link less. */
-        if ((r = l2s_unlinked(to)) < 0) return r;
         long flags = nr == NR_renameat ? 0 : (long) x[4];
-        r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
-        if (r != -EACCES) return r;
-        /* Root renames out of and into read-only directories (dpkg's .dpkg-new into place). */
-        char from_dir[PATH_MAX], to_dir[PATH_MAX];
-        uint32_t from_mode, to_mode;
-        int from_unlocked = unlock_dir(from, from_dir, &from_mode);
-        int to_unlocked = unlock_dir(to, to_dir, &to_mode);
-        if (from_unlocked || to_unlocked) r = sys6(NR_renameat2, AT_FDCWD, (long) from, AT_FDCWD, (long) to, flags, 0);
-        if (to_unlocked) relock_dir(to_dir, to_mode);
-        if (from_unlocked) relock_dir(from_dir, from_mode);
-        return r;
+        return l2s_rename(from, to, flags);
     }
     case NR_fchmodat:
     case NR_fchmodat2: {
