@@ -1314,10 +1314,16 @@ static long emulate(long nr, const uint64_t* x) {
          * refuses: say it is unsupported, so programs (Qt's QTemporaryFile,
          * glibc's tmpfile()) fall back to a named file. */
         if (flags & 020000000 /* __O_TMPFILE */) return -95 /* EOPNOTSUPP */;
-        long r = open_direct(dirfd, path, flags, (long) x[3]);
+        char guest[PATH_MAX], host[PATH_MAX];
+        if (!path) return -EFAULT;
+        if (!*path) return -ENOENT;
+        long r = guest_absolute(dirfd, path, guest);
+        if (r < 0) return r;
+        r = open_direct(guest, flags, (long) x[3]);
         if (r != -ELOOP && r != -EINVAL && r != -EACCES) return l2s_path_fd(r, flags);
         int follow = !(flags & O_NOFOLLOW) && (flags & (O_CREAT | O_EXCL)) != (O_CREAT | O_EXCL);
-        ON_HOST(follow, l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags));
+        r = to_host(guest, follow, host, 0);
+        return r < 0 ? r : l2s_path_fd(open_as_root(NR_openat, host, flags, flags, (long) x[3]), flags);
     }
     case NR_openat2: {
         const struct open_how* how = (const struct open_how*) x[2];

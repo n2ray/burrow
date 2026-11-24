@@ -707,15 +707,11 @@ long host_fd(long dirfd, const char* path, int follow, char* host, long* fd) {
     return r;
 }
 
-long open_direct(long dirfd, const char* path, long flags, long mode) {
-    char guest[PATH_MAX], host[PATH_MAX];
-    if (path == 0) return -EFAULT;
-    if (path[0] == 0) return -ENOENT;
-    long r = guest_absolute(dirfd, path, guest);
-    if (r < 0) return r;
+long open_direct(const char* guest, long flags, long mode) {
+    char host[PATH_MAX];
     if (!direct(guest)) return -ELOOP;
     uint64_t start = stats_start();
-    r = host_of(guest, length_of(guest), host);
+    long r = host_of(guest, length_of(guest), host);
     if (r < 0) return r;
     struct open_how how = {(uint64_t) flags, flags & O_CREAT ? (uint64_t) mode & 07777 : 0, RESOLVE_NO_SYMLINKS};
     r = open_how_host(host, &how);

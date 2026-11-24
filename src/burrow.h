@@ -262,7 +262,7 @@ long host_fd(long dirfd, const char* path, int follow, char* host, long* fd);
 /* openat() in one walk, when the kernel resolves the path as we would: a
  * plain path and no symlink. -ELOOP, -EINVAL (openat2() is stricter) and
  * -EACCES (the fake root's permissions) mean taking to_host()'s way. */
-long open_direct(long dirfd, const char* path, long flags, long mode);
+long open_direct(const char* guest, long flags, long mode);
 
 /* trap.c */
 void install_handler(void);
