@@ -172,11 +172,10 @@ static void collapse(const char* host, const char* intermediate, const char* fin
     if (sys(NR_renameat, AT_FDCWD, final, AT_FDCWD, other) == 0) sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
 }
 
-long l2s_unlinked(const char* host) {
-    char intermediate[PATH_MAX], final[PATH_MAX], next[PATH_MAX];
-    struct kstat st;
-    if (sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW) < 0 || (st.mode & S_IFMT) != S_IFLNK) return 0;
-    if (!resolve_link(host, intermediate, final)) return 0;
+/* Drop the displaced name from a chain. rename looks it up before the
+ * syscall, when the old destination still has a directory entry. */
+static long drop_link(const char* host, const char* intermediate, const char* final) {
+    char next[PATH_MAX];
     long count = count_of(final) - 1;
     long r;
     if (count > 0) {
@@ -189,6 +188,28 @@ long l2s_unlinked(const char* host) {
     }
     sys(NR_unlinkat, AT_FDCWD, intermediate, 0, 0);
     return sys(NR_unlinkat, AT_FDCWD, final, 0, 0);
+}
+
+long l2s_unlinked(const char* host) {
+    char intermediate[PATH_MAX], final[PATH_MAX];
+    struct kstat st;
+    if (sys(NR_newfstatat, AT_FDCWD, host, &st, AT_SYMLINK_NOFOLLOW) < 0 || (st.mode & S_IFMT) != S_IFLNK) return 0;
+    if (!resolve_link(host, intermediate, final)) return 0;
+    return drop_link(host, intermediate, final);
+}
+
+long l2s_rename(const char* from, const char* to, long flags) {
+    char intermediate[PATH_MAX], final[PATH_MAX];
+    /* NOREPLACE cannot displace an existing entry; EXCHANGE keeps both. */
+    int replaces = !(flags & 3 /* RENAME_NOREPLACE | RENAME_EXCHANGE */) && resolve_link(to, intermediate, final);
+    if (replaces && flags == 0) {
+        /* Two names for one guest inode: ordinary rename is a no-op. */
+        char source[PATH_MAX];
+        if (read_link(from, source) > 0 && same(source, intermediate)) return 0;
+    }
+    long r = rename_as_root(from, to, flags);
+    if (r == 0 && replaces) return drop_link(to, intermediate, final);
+    return r;
 }
 
 /* Moves @old to the file of a new chain named after @name in the directory
